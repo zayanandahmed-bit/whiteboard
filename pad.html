@@ -263,10 +263,15 @@ function norm(e){
   return { x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
            y: Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height)) };
 }
-let triedFS = false;
+let triedFS = false, lastTouchT = 0, lastPt = {x:0, y:0};
 pad.addEventListener('pointerdown', e => {
-  if (active !== null) return;                   // one finger draws; extra fingers are ignored
+  // one finger draws; a second finger is ignored — unless the first one went quiet (its "lift" got lost), then start fresh
+  if (active !== null){
+    if (performance.now() - lastTouchT < 250) return;
+    up({pointerId: active, clientX: 0, clientY: 0, stale: true});
+  }
   e.preventDefault();
+  lastTouchT = performance.now();
   if (!triedFS && canFS && !standalone){ triedFS = true; goFull(); }
   active = e.pointerId; try { pad.setPointerCapture(e.pointerId); } catch(err){}
   const p = norm(e);
@@ -278,16 +283,19 @@ pad.addEventListener('pointermove', e => {
   if (e.pointerId !== active) return;
   const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
   const t = trails[trails.length-1];
-  for (const ev of (evs.length ? evs : [e])){ const p = norm(ev); send({t:'m', x:p.x, y:p.y}); t.pts.push(p); }
+  lastTouchT = performance.now();
+  for (const ev of (evs.length ? evs : [e])){ const p = norm(ev); lastPt = p; send({t:'m', x:p.x, y:p.y}); if (t) t.pts.push(p); }
 });
 function up(e){
   if (e.pointerId !== active) return;
   active = null;
-  const p = norm(e); send({t:'u', x:p.x, y:p.y});
-  const t = trails[trails.length-1]; if (t) t.end = performance.now();
+  const p = e.stale ? lastPt : norm(e); send({t:'u', x:p.x, y:p.y});
+  const t = trails[trails.length-1]; if (t && !t.end) t.end = performance.now();
 }
 pad.addEventListener('pointerup', up);
 pad.addEventListener('pointercancel', up);
+pad.addEventListener('lostpointercapture', up);
+addEventListener('blur', () => { if (active !== null) up({pointerId: active, stale: true}); });
 document.addEventListener('touchmove', e => { if (!e.target.closest('#sheet .card')) e.preventDefault(); }, {passive:false});
 document.addEventListener('gesturestart', e => e.preventDefault());
 
@@ -308,41 +316,90 @@ function paint(){
   return trails.length > 0;
 }
 function loop(){ if (raf) return; const f = () => { raf = paint() ? requestAnimationFrame(f) : 0; }; raf = requestAnimationFrame(f); }
-async function keepAwake(){ try { if (!wake && navigator.wakeLock) { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => wake = null); } } catch(e){} }
+let wantWake = false;
+async function keepAwake(){ wantWake = true; try { if (!wake && navigator.wakeLock) { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => wake = null); } } catch(e){} }
 
-/* ---------- connection ---------- */
-function connect(){
-  if (!peer || peer.destroyed || !peer.open) return;
-  const c = peer.connect(id, {reliable:true, serialization:'json'});
-  c.on('open', () => { conn = c; status('Connected to laptop', true); msg(); send({cmd:'hello'}); send({cmd:'mirror', v:keep}); });
-  c.on('data', d => {
-    if (!d) return;
-    if (d.cmd === 'sync'){ state = d; aspect = d.aspect || aspect; syncUI(); layout(); }
-    else if (d.cmd === 'board' && keep){
-      board = d;
-      const now = performance.now();                 // the real stroke is on the board now: let the preview go
-      for (const t of trails) if (t.end) t.end = Math.min(t.end, now - 1300);
-      paint(); loop();
-    }
-  });
-  c.on('close', () => { if (conn === c){ conn = null; status('Reconnecting…'); msg('Lost the laptop', 'Reconnecting… keep the whiteboard open.'); setTimeout(connect, 1500); } });
+/* ---------- connection: heartbeat + self-healing reconnect ---------- */
+let lastRx = 0, pending = null, chunks = {};
+const now = () => performance.now();
+function retry(ms = 1500){ clearTimeout(retry.t); retry.t = setTimeout(connect, ms); }
+function lost(why){
+  if (conn){ const c = conn; conn = null; try { c.close(); } catch(e){} }
+  if (active !== null) up({pointerId: active, stale: true});
+  status('Reconnecting…'); msg('Reconnecting…', why || 'Keep the whiteboard open on the laptop.');
+  retry();
 }
+function makePeer(){
+  if (peer) try { peer.destroy(); } catch(e){}
+  peer = new Peer();
+  peer.on('open', () => connect());
+  peer.on('disconnected', () => { setTimeout(() => { try { if (!peer.destroyed && peer.disconnected) peer.reconnect(); } catch(e){ makePeer(); } }, 800); });
+  peer.on('error', e => {
+    pending = null;
+    if (e.type === 'peer-unavailable'){ status('Laptop not found'); msg('Laptop not found', 'Make sure the whiteboard is open on the laptop. Retrying…'); retry(2000); }
+    else if (['network','server-error','socket-error','socket-closed','unavailable-id'].includes(e.type)){ status('Reconnecting…'); setTimeout(makePeer, 2000); }
+    else { status('Problem: ' + e.type); retry(2500); }
+  });
+}
+function onData(d){
+  lastRx = now();
+  if (!d) return;
+  if (d.cmd === 'bc'){                               // big board arrives in chunks — reassemble
+    const b = chunks[d.k] = chunks[d.k] || [];
+    b[d.i] = d.s;
+    if (b.filter(x => x !== undefined).length === d.n){ delete chunks[d.k]; for (const k in chunks) if (+k < d.k) delete chunks[k]; try { onData(JSON.parse(b.join(''))); } catch(e){} }
+    return;
+  }
+  if (d.cmd === 'sync'){ state = d; aspect = d.aspect || aspect; syncUI(); layout(); }
+  else if (d.cmd === 'board' && keep){
+    board = d;
+    const t0 = now();                                // the real stroke is on the board now: let the preview go
+    for (const t of trails) if (t.end) t.end = Math.min(t.end, t0 - 1300);
+    paint(); loop();
+  }
+}
+function connect(){
+  if (!id || !window.Peer) return;
+  if (!peer || peer.destroyed){ makePeer(); return; }
+  if (peer.disconnected){ try { peer.reconnect(); } catch(e){ makePeer(); } return; }   // 'open' calls us again
+  if (!peer.open || (conn && conn.open) || pending) return;
+  const c = peer.connect(id, {reliable:true, serialization:'json'});
+  pending = c;
+  const giveUp = setTimeout(() => { if (pending === c){ pending = null; try { c.close(); } catch(e){} retry(500); } }, 8000);
+  c.on('open', () => {
+    clearTimeout(giveUp); pending = null; conn = c; lastRx = now();
+    status('Connected to laptop', true); msg(); send({cmd:'hello'}); send({cmd:'mirror', v:keep});
+  });
+  c.on('data', d => { if (conn === c) onData(d); });
+  c.on('close', () => { clearTimeout(giveUp); if (pending === c) pending = null; if (conn === c) lost(); });
+  c.on('error', () => {});
+}
+// heartbeat: ping every 2 s; if the laptop has said nothing for 6 s the link is dead — rebuild it
+setInterval(() => {
+  if (document.hidden) return;
+  if (conn && conn.open){
+    send({cmd:'ping'});
+    if (now() - lastRx > 6000) lost('The connection dropped.');
+  } else if (conn && !conn.open) lost();
+  else if (!pending) connect();
+}, 2000);
 if (!id){
   status('No laptop');
   msg('Open this from the laptop', 'On the whiteboard, click <b style="display:inline">Phone</b> and scan the QR code.');
 } else if (!window.Peer){
   status('Offline');
   msg('Could not load', 'Check your internet connection and reload.');
-} else {
-  peer = new Peer();
-  peer.on('open', connect);
-  peer.on('error', e => {
-    if (e.type === 'peer-unavailable'){ status('Laptop not found'); msg('Laptop not found', 'Make sure the whiteboard is open on the laptop. Retrying…'); setTimeout(connect, 2000); }
-    else { status('Problem: ' + e.type); setTimeout(connect, 2500); }
-  });
-  peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} });
+} else makePeer();
+function wakeUp(){
+  if (document.hidden) return;
+  if (wantWake && !wake) keepAwake();             // iOS drops the screen-awake lock whenever the page is hidden
+  if (conn && conn.open && now() - lastRx < 4000) return;
+  if (conn) lost(); else connect();
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden && !conn) connect(); });
+window.__pad = { get board(){ return board; }, get conn(){ return conn; }, get active(){ return active; }, ageRx(ms){ lastRx -= ms; } };   // for debugging
+document.addEventListener('visibilitychange', wakeUp);
+addEventListener('pageshow', wakeUp);
+addEventListener('online', () => setTimeout(wakeUp, 500));
 syncUI(); setKeep(keep, true); layout();
 })();
 </script>

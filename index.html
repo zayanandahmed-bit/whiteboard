@@ -736,13 +736,19 @@ function phonePeer(id){
   const p = new Peer(id); PH.peer = p;
   p.on('open', id => { PH.id = id; try { localStorage.setItem(KEY + '-phone', id); } catch(e){} phoneQR(); phoneStatus(PH.conns.size ? 'Phone connected' : 'Waiting for your phone…', PH.conns.size); });
   p.on('connection', c => {
-    c.on('open', () => { PH.conns.add(c); phoneSync(); updPhone(); $('#phoneModal').classList.remove('open'); toast('Phone connected — draw on it'); });
+    c.on('open', () => { c.lastRx = performance.now(); PH.conns.add(c); phoneSync(); updPhone(); $('#phoneModal').classList.remove('open'); toast('Phone connected — draw on it'); });
     c.on('data', d => onPhone(d, c));
     c.on('close', () => { if (PH.conns.delete(c)){ phoneLift(); updPhone(); toast('Phone disconnected'); } });
   });
-  p.on('disconnected', () => { setTimeout(() => { try { if (!p.destroyed) p.reconnect(); } catch(e){} }, 1000); });
+  // keep trying to stay registered with the pairing service, or the phone can't find this laptop again
+  const keepAlive = () => { if (PH.peer !== p || p.destroyed) return; if (p.disconnected){ try { p.reconnect(); } catch(e){} setTimeout(keepAlive, 3000); } };
+  p.on('disconnected', () => setTimeout(keepAlive, 1000));
   p.on('error', e => {
     if (e.type === 'unavailable-id'){ p.destroy(); PH.peer = null; phonePeer(newPhoneId()); }
+    else if (['network','server-error','socket-error','socket-closed'].includes(e.type)){
+      phoneStatus('Connection problem — retrying…');
+      setTimeout(() => { if (PH.peer === p && (p.destroyed || p.disconnected)){ try { p.destroy(); } catch(err){} PH.peer = null; phonePeer(PH.id || id); } }, 3000);
+    }
     else if (e.type !== 'peer-unavailable') phoneStatus('Connection problem (' + e.type + ') — retrying…');
   });
 }
@@ -768,18 +774,37 @@ const thin = (p, k) => { const o = []; for (let i = 0; i < p.length; i += 2*k) o
 function boardMsg(){
   const objs = S.objs.map(o => { const q = {...o, c: col(o.c)}; if (o.pts) q.pts = o.pts.map(v => Math.round(v*10)/10); return q; });
   const msg = {cmd:'board', W, H, v:{x:V.x, y:V.y, z:V.z}, dark:S.dark, objs};
-  for (let k = 2; JSON.stringify(msg).length > 200000 && k <= 32; k *= 2)   // keep big boards under the data-channel limit
+  for (let k = 2; JSON.stringify(msg).length > 600000 && k <= 32; k *= 2)   // very big boards: thin the preview strokes
     msg.objs = objs.map(o => o.pts && o.pts.length > 8 ? {...o, pts: thin(o.pts, k)} : o);
   return msg;
 }
+// iPhone Safari rejects large single messages (and may drop the link), so big payloads go out in 15 KB chunks
+let chunkSeq = 0;
+function phoneSend(c, m){
+  const s = JSON.stringify(m);
+  try {
+    if (s.length <= 15000){ c.send(m); return; }
+    const k = ++chunkSeq, n = Math.ceil(s.length / 15000);
+    for (let i = 0; i < n; i++) c.send({cmd:'bc', k, i, n, s: s.slice(i*15000, (i+1)*15000)});
+  } catch(e){}
+}
 function phoneBoardSoon(){
   if (![...PH.conns].some(c => c.mirror)) return;
-  clearTimeout(PH.bt); PH.bt = setTimeout(() => { const m = boardMsg(); for (const c of PH.conns) if (c.mirror) try { c.send(m); } catch(e){} }, 120);
+  clearTimeout(PH.bt); PH.bt = setTimeout(() => { const m = boardMsg(); for (const c of PH.conns) if (c.mirror) phoneSend(c, m); }, 120);
 }
+// a phone that has gone quiet (it pings every 2 s) is gone — drop it so it can reconnect cleanly
+setInterval(() => {
+  for (const c of PH.conns) if (performance.now() - (c.lastRx || 0) > 10000){
+    PH.conns.delete(c); try { c.close(); } catch(e){}
+    phoneLift(); updPhone();
+  }
+}, 3000);
 function onPhone(d, c){
   if (!d) return;
+  c.lastRx = performance.now();
   if (d.cmd){
-    if (d.cmd === 'mirror'){ c.mirror = !!d.v; if (c.mirror) phoneBoardSoon(); }
+    if (d.cmd === 'ping'){ try { c.send({cmd:'pong'}); } catch(e){} }
+    else if (d.cmd === 'mirror'){ c.mirror = !!d.v; if (c.mirror) phoneBoardSoon(); }
     else if (d.cmd === 'color') setColor(d.v);
     else if (d.cmd === 'width') setWidth(d.v);
     else if (d.cmd === 'tool') setTool(d.v === 'eraser' ? 'eraser' : 'pen');
@@ -790,6 +815,7 @@ function onPhone(d, c){
   }
   const sx = clamp(d.x, 0, 1) * W, sy = clamp(d.y, 0, 1) * H, [x, y] = toW(sx, sy);
   if (d.t === 'd'){
+    if (PH.touch) phoneLift();                     // never join a new touch onto the previous line
     if (ed) closeText(true);
     if (penDown) setPen(false);
     if (S.tool !== 'pen' && S.tool !== 'eraser') setTool('pen');
