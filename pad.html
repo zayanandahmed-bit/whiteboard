@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0e0e12">
+<title>Whiteboard Pad</title>
+<style>
+:root{--bg:#0e0e12;--panel:#1b1b21;--border:rgba(255,255,255,.08);--text:#f4f4f5;--sub:#a1a1aa;--accent:#818cf8;--ok:#34d399;--warn:#fbbf24;
+  --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--font);
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;overscroll-behavior:none}
+body{position:fixed;inset:0;display:flex;flex-direction:column;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}
+#bar{flex:none;display:flex;align-items:center;gap:6px;padding:8px 10px;overflow-x:auto;scrollbar-width:none}
+#bar::-webkit-scrollbar{display:none}
+.grp{display:flex;align-items:center;gap:4px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:4px;flex:none}
+.st{display:flex;align-items:center;gap:8px;padding:0 10px;height:40px;font:600 13px var(--font);white-space:nowrap}
+.st i{width:9px;height:9px;border-radius:50%;background:var(--warn)}
+.st.live i{background:var(--ok);box-shadow:0 0 0 3px rgba(52,211,153,.25)}
+button{appearance:none;border:0;background:transparent;color:var(--text);font:600 12px var(--font);height:40px;min-width:40px;padding:0 10px;
+  border-radius:10px;display:flex;align-items:center;justify-content:center;gap:6px}
+button:active{transform:scale(.94)}
+button.on{background:var(--accent);color:#0e0e14}
+button svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.sw{width:30px;height:30px;min-width:30px;padding:0;border-radius:50%;margin:0 2px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.2)}
+.sw.on{background-clip:padding-box;box-shadow:0 0 0 2px var(--panel),0 0 0 4px var(--accent)}
+.wd i{display:block;width:20px;border-radius:6px;background:currentColor}
+#stage{flex:1;position:relative;min-height:0}
+#pad{position:absolute;border-radius:18px;background:#fff;overflow:hidden;box-shadow:0 0 0 1px var(--border),0 20px 50px -10px rgba(0,0,0,.6)}
+#pad canvas{position:absolute;inset:0;width:100%;height:100%}
+#pad .corner{position:absolute;font:600 11px var(--font);color:rgba(113,113,122,.55);pointer-events:none}
+#msg{position:absolute;inset:0;display:grid;place-items:center;text-align:center;padding:24px;pointer-events:none}
+#msg div{background:rgba(14,14,18,.86);border:1px solid var(--border);border-radius:16px;padding:18px 22px;max-width:340px;font-size:15px;line-height:1.45}
+#msg b{display:block;font-size:17px;margin-bottom:4px}
+#rot{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);font:600 12.5px var(--font);color:var(--sub);white-space:nowrap;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="bar">
+  <div class="grp"><div class="st" id="st"><i></i><span>Connecting…</span></div></div>
+  <div class="grp" id="colors"></div>
+  <div class="grp" id="widths"></div>
+  <div class="grp">
+    <button id="pen" class="on"><svg viewBox="0 0 24 24"><path d="M4 20l4.5-1L19 8.5 15.5 5 5 15.5z"/></svg>Pen</button>
+    <button id="eraser"><svg viewBox="0 0 24 24"><path d="M8 20h12"/><path d="M4.6 13.4l8.8-8.8a2 2 0 0 1 2.8 0l3.2 3.2a2 2 0 0 1 0 2.8L11 19H8l-3.4-3.4a1.5 1.5 0 0 1 0-2.2z"/></svg>Erase</button>
+  </div>
+  <div class="grp">
+    <button id="undo"><svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg></button>
+    <button id="redo"><svg viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg></button>
+  </div>
+</div>
+<div id="stage">
+  <div id="pad"><canvas id="cv"></canvas></div>
+  <div id="rot"></div>
+  <div id="msg"><div><b>Connecting to your laptop…</b>Keep the whiteboard open on the laptop.</div></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(() => {
+const $ = s => document.querySelector(s);
+const id = decodeURIComponent(location.hash.slice(1));
+const pad = $('#pad'), cv = $('#cv'), ctx = cv.getContext('2d'), stage = $('#stage');
+let conn = null, peer = null, aspect = 16/10, state = {color:'ink', wi:1, tool:'pen', colors:[], bg:'#ffffff'};
+let rect = null, active = null, trails = [], raf = 0, wake = null;
+
+function msg(title, text){ const m = $('#msg'); if (!title){ m.style.display = 'none'; return; } m.style.display = 'grid'; m.innerHTML = `<div><b>${title}</b>${text}</div>`; }
+function status(text, live){ const s = $('#st'); s.classList.toggle('live', !!live); s.querySelector('span').textContent = text; }
+const send = d => { if (conn && conn.open) try { conn.send(d); } catch(e){} };
+
+/* ---------- layout: pad has the laptop screen's shape ---------- */
+function layout(){
+  const r = stage.getBoundingClientRect(), m = 10;
+  let w = r.width - m*2, h = w / aspect;
+  if (h > r.height - m*2){ h = r.height - m*2; w = h * aspect; }
+  Object.assign(pad.style, {width:w+'px', height:h+'px', left:(r.width-w)/2+'px', top:(r.height-h)/2+'px'});
+  const dpr = devicePixelRatio || 1;
+  cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  rect = null;
+  $('#rot').textContent = (innerHeight > innerWidth && aspect > 1) ? 'Turn your phone sideways for a bigger pad' : '';
+  paint();
+}
+addEventListener('resize', layout);
+addEventListener('orientationchange', () => setTimeout(layout, 300));
+
+/* ---------- toolbar ---------- */
+function buildBar(){
+  const c = $('#colors'); c.innerHTML = '';
+  for (const [k, hex] of state.colors){
+    const b = document.createElement('button'); b.className = 'sw' + (k === state.color ? ' on' : ''); b.style.background = hex;
+    b.onclick = () => { send({cmd:'color', v:k}); if (state.tool === 'eraser') send({cmd:'tool', v:'pen'}); };
+    c.appendChild(b);
+  }
+  const w = $('#widths'); w.innerHTML = '';
+  [3,6,11].forEach((px, i) => {
+    const b = document.createElement('button'); b.className = 'wd' + (i === state.wi ? ' on' : '');
+    b.innerHTML = `<i style="height:${px}px"></i>`; b.onclick = () => send({cmd:'width', v:i}); w.appendChild(b);
+  });
+  $('#pen').classList.toggle('on', state.tool !== 'eraser');
+  $('#eraser').classList.toggle('on', state.tool === 'eraser');
+  pad.style.background = state.bg;
+}
+$('#pen').onclick = () => send({cmd:'tool', v:'pen'});
+$('#eraser').onclick = () => send({cmd:'tool', v:'eraser'});
+$('#undo').onclick = () => send({cmd:'undo'});
+$('#redo').onclick = () => send({cmd:'redo'});
+
+/* ---------- touch → normalized board coordinates ---------- */
+function norm(e){
+  rect = rect || pad.getBoundingClientRect();
+  return { x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
+           y: Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height)) };
+}
+function colorHex(){ const f = state.colors.find(c => c[0] === state.color); return state.tool === 'eraser' ? 'rgba(225,29,72,.5)' : (f ? f[1] : '#18181b'); }
+pad.addEventListener('pointerdown', e => {
+  if (active !== null) return;                   // one finger draws; extra fingers are ignored
+  e.preventDefault();
+  active = e.pointerId; pad.setPointerCapture(e.pointerId);
+  const p = norm(e);
+  send({t:'d', x:p.x, y:p.y});
+  trails.push({pts:[p], c:colorHex(), w:[3,6,11][state.wi] * (state.tool === 'eraser' ? 3 : 1), end:0});
+  keepAwake(); loop();
+});
+pad.addEventListener('pointermove', e => {
+  if (e.pointerId !== active) return;
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  const t = trails[trails.length-1];
+  for (const ev of (evs.length ? evs : [e])){ const p = norm(ev); send({t:'m', x:p.x, y:p.y}); t.pts.push(p); }
+});
+function up(e){
+  if (e.pointerId !== active) return;
+  active = null;
+  const p = norm(e); send({t:'u', x:p.x, y:p.y});
+  const t = trails[trails.length-1]; if (t) t.end = performance.now();
+}
+pad.addEventListener('pointerup', up);
+pad.addEventListener('pointercancel', up);
+document.addEventListener('touchmove', e => e.preventDefault(), {passive:false});
+document.addEventListener('gesturestart', e => e.preventDefault());
+
+/* local preview: what you draw shows briefly on the phone, then fades */
+function paint(){
+  const w = cv.width / (devicePixelRatio||1), h = cv.height / (devicePixelRatio||1), now = performance.now();
+  ctx.clearRect(0, 0, w, h);
+  trails = trails.filter(t => !t.end || now - t.end < 1600);
+  for (const t of trails){
+    ctx.globalAlpha = t.end ? Math.max(0, 1 - (now - t.end)/1600) : 1;
+    ctx.strokeStyle = t.c; ctx.lineWidth = t.w; ctx.lineCap = ctx.lineJoin = 'round';
+    ctx.beginPath(); t.pts.forEach((p, i) => i ? ctx.lineTo(p.x*w, p.y*h) : ctx.moveTo(p.x*w, p.y*h));
+    if (t.pts.length === 1) ctx.lineTo(t.pts[0].x*w + .1, t.pts[0].y*h);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  return trails.length > 0;
+}
+function loop(){ if (raf) return; const f = () => { raf = paint() ? requestAnimationFrame(f) : 0; }; raf = requestAnimationFrame(f); }
+async function keepAwake(){ try { if (!wake && navigator.wakeLock) { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => wake = null); } } catch(e){} }
+
+/* ---------- connection ---------- */
+function connect(){
+  if (!peer || peer.destroyed || !peer.open) return;
+  const c = peer.connect(id, {reliable:true, serialization:'json'});
+  c.on('open', () => { conn = c; status('Connected', true); msg(); send({cmd:'hello'}); });
+  c.on('data', d => { if (d && d.cmd === 'sync'){ state = d; aspect = d.aspect || aspect; buildBar(); layout(); } });
+  c.on('close', () => { if (conn === c){ conn = null; status('Reconnecting…'); msg('Lost the laptop', 'Reconnecting… keep the whiteboard open.'); setTimeout(connect, 1500); } });
+}
+if (!id){
+  status('No laptop');
+  msg('Open this from the laptop', 'On the whiteboard, click <b style="display:inline">Phone</b> and scan the QR code.');
+} else if (!window.Peer){
+  status('Offline');
+  msg('Could not load', 'Check your internet connection and reload.');
+} else {
+  peer = new Peer();
+  peer.on('open', connect);
+  peer.on('error', e => {
+    if (e.type === 'peer-unavailable'){ status('Laptop not found'); msg('Laptop not found', 'Make sure the whiteboard is open on the laptop. Retrying…'); setTimeout(connect, 2000); }
+    else { status('Problem: ' + e.type); setTimeout(connect, 2500); }
+  });
+  peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} });
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && !conn) connect(); });
+layout();
+})();
+</script>
+</body>
+</html>

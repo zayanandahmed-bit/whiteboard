@@ -130,6 +130,19 @@ body{transition:background .25s}
 .card .go{margin-top:22px;display:flex;gap:10px;justify-content:flex-end}
 .card .go .btn{height:46px;flex-direction:row;font-size:14.5px;padding:0 20px}
 
+/* phone pairing */
+#ghost{position:fixed;left:0;top:0;width:18px;height:18px;margin:-9px 0 0 -9px;border-radius:50%;pointer-events:none;z-index:6;display:none;
+  border:2px solid var(--accent);background:color-mix(in srgb,var(--accent) 25%,transparent)}
+.pair{display:grid;grid-template-columns:auto 1fr;gap:28px;align-items:center}
+.qr{width:236px;height:236px;padding:14px;background:#fff;border-radius:18px;border:1px solid var(--border);display:grid;place-items:center}
+.qr svg{width:100%;height:100%}
+.qr .wait{color:#71717a;font-size:14px;text-align:center}
+.pair .status{display:flex;align-items:center;gap:10px;margin-top:18px;font-weight:600;font-size:14.5px}
+.pair .status i{width:10px;height:10px;border-radius:50%;background:var(--sub)}
+.pair .status.live i{background:var(--ok)}
+.pair .link{margin-top:10px;font:500 12px ui-monospace,Menlo,monospace;color:var(--sub);word-break:break-all}
+@media (max-width:700px){.pair{grid-template-columns:1fr}}
+
 /* text editor */
 .editor{position:fixed;margin:0;padding:0;border:0;background:transparent;resize:none;overflow:hidden;white-space:pre;
   outline:2px dashed var(--accent);outline-offset:8px;border-radius:2px;line-height:1.25;z-index:8;caret-color:var(--accent)}
@@ -182,6 +195,7 @@ body.armed .topbar>.panel:not(.chip),body.armed .dock,body.armed .bottombar,body
   </div>
   <div class="sep"></div>
   <button class="btn soft" id="snap" data-ic="snap" data-tip="Straighten lines, clean up boxes & circles" data-key="S"><span id="snapL">Snap</span></button>
+  <button class="btn soft" id="phone" data-ic="phone" data-tip="Draw from your phone — scan a QR code"><i class="led" id="phoneLed"></i><span>Phone</span></button>
   <button class="btn soft" id="tablet" data-ic="tablet" data-tip="Tablet mode — your trackpad becomes the board" data-key="B"><i class="led" id="led"></i><span>Tablet</span></button>
   <div class="menuwrap">
     <button class="btn soft" id="tpl" data-ic="tpl" data-tip="Insert a ready-made diagram"><span>Templates</span></button>
@@ -200,6 +214,26 @@ body.armed .topbar>.panel:not(.chip),body.armed .dock,body.armed .bottombar,body
   <button class="btn" id="zfit" data-ic="fit" data-tip="Fit everything on screen" data-key="⇧ 1"></button>
 </div>
 
+<div id="ghost"></div>
+<div class="modal" id="phoneModal">
+  <div class="card">
+    <button class="btn x" data-close data-ic="close"></button>
+    <h2>Draw from your phone</h2>
+    <p class="lead">Your phone screen becomes the drawing pad. Works on Wi-Fi or mobile data — nothing to install.</p>
+    <div class="pair">
+      <div class="qr" id="qr"><div class="wait">Preparing…</div></div>
+      <div>
+        <ol>
+          <li>Point your phone camera at the code and open the link.</li>
+          <li>Turn the phone sideways — the pad matches this screen.</li>
+          <li>Draw with your finger. Top-right of the phone is top-right of the board. Lift to stop.</li>
+        </ol>
+        <div class="status" id="phoneStatus"><i></i><span>Connecting…</span></div>
+        <div class="link" id="phoneLink"></div>
+      </div>
+    </div>
+  </div>
+</div>
 <div id="tip"></div>
 <div id="toast"></div>
 
@@ -273,6 +307,7 @@ const ICONS = {
   exitfull:'<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
   png:'<path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/>',
   snap:'<path d="M6 4v7a6 6 0 0 0 12 0V4"/><path d="M6 8h4M14 8h4"/>',
+  phone:'<rect x="6.5" y="2.5" width="11" height="19" rx="2.5"/><path d="M11 18.5h2"/>',
   tablet:'<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M8 12.5c1.5-2 2.5 2 4 0s2.5 2 4 0"/>',
   tpl:'<rect x="3.5" y="4" width="7" height="7" rx="1.5"/><rect x="13.5" y="4" width="7" height="7" rx="1.5"/><rect x="3.5" y="14" width="7" height="7" rx="1.5"/><path d="M17 14.5v6M14 17.5h6"/>',
   grid:'<circle cx="6" cy="6" r=".8"/><circle cx="12" cy="6" r=".8"/><circle cx="18" cy="6" r=".8"/><circle cx="6" cy="12" r=".8"/><circle cx="12" cy="12" r=".8"/><circle cx="18" cy="12" r=".8"/><circle cx="6" cy="18" r=".8"/><circle cx="12" cy="18" r=".8"/><circle cx="18" cy="18" r=".8"/>',
@@ -545,6 +580,7 @@ function resize(){
   cv.width = Math.round(W*DPR); cv.height = Math.round(H*DPR);
   cv.style.width = W+'px'; cv.style.height = H+'px';
   render();
+  if (typeof phoneSync === 'function') phoneSync();
 }
 
 /* ---------- camera ---------- */
@@ -675,6 +711,89 @@ function tabletLift(){
   lastE = null; updCursor();
 }
 
+/* ---------- phone as drawing pad (WebRTC via the free PeerJS broker) ---------- */
+const PEERJS = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js';
+const QRJS = 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js';
+const PAD_URL = 'https://zayanandahmed-bit.github.io/whiteboard/pad.html';
+const PH = { peer:null, conns:new Set(), id:null, touch:false, loading:null };
+const ghost = $('#ghost');
+const loadScript = src => new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej; document.head.appendChild(s); });
+const newPhoneId = () => 'wb-' + Math.random().toString(36).slice(2, 10);
+function phoneStatus(text, live){ const s = $('#phoneStatus'); s.classList.toggle('live', !!live); s.querySelector('span').textContent = text; }
+async function phoneOpen(){
+  settle(false);
+  $('#phoneModal').classList.add('open');
+  if (PH.peer){ phoneQR(); return; }
+  try {
+    PH.loading = PH.loading || Promise.all([loadScript(PEERJS), loadScript(QRJS)]);
+    await PH.loading;
+  } catch(e){ PH.loading = null; phoneStatus('Could not load — check the internet connection'); return; }
+  let id = null; try { id = localStorage.getItem(KEY + '-phone'); } catch(e){}
+  phonePeer(id || newPhoneId());
+}
+function phonePeer(id){
+  phoneStatus('Connecting…');
+  const p = new Peer(id); PH.peer = p;
+  p.on('open', id => { PH.id = id; try { localStorage.setItem(KEY + '-phone', id); } catch(e){} phoneQR(); phoneStatus(PH.conns.size ? 'Phone connected' : 'Waiting for your phone…', PH.conns.size); });
+  p.on('connection', c => {
+    c.on('open', () => { PH.conns.add(c); phoneSync(); updPhone(); $('#phoneModal').classList.remove('open'); toast('Phone connected — draw on it'); });
+    c.on('data', onPhone);
+    c.on('close', () => { if (PH.conns.delete(c)){ phoneLift(); updPhone(); toast('Phone disconnected'); } });
+  });
+  p.on('disconnected', () => { setTimeout(() => { try { if (!p.destroyed) p.reconnect(); } catch(e){} }, 1000); });
+  p.on('error', e => {
+    if (e.type === 'unavailable-id'){ p.destroy(); PH.peer = null; phonePeer(newPhoneId()); }
+    else if (e.type !== 'peer-unavailable') phoneStatus('Connection problem (' + e.type + ') — retrying…');
+  });
+}
+function phoneQR(){
+  if (!PH.id || !window.qrcode) return;
+  const url = PAD_URL + '#' + PH.id, qr = qrcode(0, 'M');
+  qr.addData(url); qr.make();
+  $('#qr').innerHTML = qr.createSvgTag(6, 0);
+  $('#phoneLink').textContent = url;
+}
+function updPhone(){
+  $('#phoneLed').classList.toggle('live', PH.conns.size > 0);
+  $('#phone').classList.toggle('on', PH.conns.size > 0);
+  if (PH.id) phoneStatus(PH.conns.size ? 'Phone connected' : 'Waiting for your phone…', PH.conns.size > 0);
+}
+function phoneSync(){
+  if (!PH.conns.size) return;
+  const msg = {cmd:'sync', aspect: W/H, color:S.color, wi:S.wi, tool:S.tool, dark:S.dark, bg:BG[S.dark?1:0], colors: COLORS.map(([k]) => [k, col(k)])};
+  for (const c of PH.conns) try { c.send(msg); } catch(e){}
+}
+function onPhone(d){
+  if (!d) return;
+  if (d.cmd){
+    if (d.cmd === 'color') setColor(d.v);
+    else if (d.cmd === 'width') setWidth(d.v);
+    else if (d.cmd === 'tool') setTool(d.v === 'eraser' ? 'eraser' : 'pen');
+    else if (d.cmd === 'undo') undo();
+    else if (d.cmd === 'redo') redo();
+    else if (d.cmd === 'hello') phoneSync();
+    return;
+  }
+  const sx = clamp(d.x, 0, 1) * W, sy = clamp(d.y, 0, 1) * H, [x, y] = toW(sx, sy);
+  if (d.t === 'd'){
+    if (ed) closeText(true);
+    if (penDown) setPen(false);
+    if (S.tool !== 'pen' && S.tool !== 'eraser') setTool('pen');
+    PH.touch = true; lastE = null; erased = false;
+  }
+  if (!PH.touch) return;
+  if (S.tool === 'eraser') eraseMove(x, y); else strokeMove(x, y);
+  Object.assign(ghost.style, {display:'block', transform:`translate(${sx}px,${sy}px)`});
+  if (d.t === 'u') phoneLift();
+}
+function phoneLift(){
+  if (!PH.touch) return;
+  PH.touch = false; ghost.style.display = 'none';
+  if (cur) endStroke();
+  lastE = null; if (erased){ erased = false; commit(); }
+}
+$('#phoneModal').addEventListener('pointerdown', e => { if (e.target.id === 'phoneModal' || e.target.closest('[data-close]')) $('#phoneModal').classList.remove('open'); });
+
 /* ---------- text ---------- */
 function openText(x, y, idx){
   let size = TEXTSIZES[S.wi] / V.z, c = S.color, text = '', orig = null;
@@ -731,7 +850,7 @@ function setTool(t){
   shapeStart = null;
   S.tool = t; save();
   $$('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool === t));
-  updHint(); updCursor(); draw();
+  updHint(); updCursor(); draw(); phoneSync();
 }
 function updHint(){
   const chip = $('#chip'); let t, s, cls = '';
@@ -776,14 +895,14 @@ function updCursor(){
   }
   st.transform = `translate(${pos.sx}px,${pos.sy}px) translate(-50%,-50%)`;
 }
-function setColor(k){ S.color = k; save(); $$('.sw').forEach(b => b.classList.toggle('on', b.dataset.c === k)); updCursor(); }
-function setWidth(i){ S.wi = clamp(i, 0, 2); save(); $$('.wbtn').forEach((b, j) => b.classList.toggle('on', j === S.wi)); updCursor(); }
+function setColor(k){ if (!PAL[k]) return; S.color = k; save(); $$('.sw').forEach(b => b.classList.toggle('on', b.dataset.c === k)); updCursor(); phoneSync(); }
+function setWidth(i){ S.wi = clamp(+i || 0, 0, 2); save(); $$('.wbtn').forEach((b, j) => b.classList.toggle('on', j === S.wi)); updCursor(); phoneSync(); }
 function setDark(d){
   S.dark = d; document.body.classList.toggle('dark', d); save();
   const b = $('#dark'); b.querySelector('svg').innerHTML = ICONS[d ? 'sun' : 'moon']; b.querySelector('span').textContent = d ? 'Light' : 'Dark';
   $$('.sw').forEach(s => s.style.background = col(s.dataset.c));
   if (ed) ed.el.style.color = col(ed.c);
-  updCursor(); render();
+  updCursor(); render(); phoneSync();
 }
 function setSnap(v){ S.snap = v; save(); $('#snap').classList.toggle('on', v); $('#snapL').textContent = v ? 'Snap on' : 'Snap'; }
 function setGrid(v){ S.grid = v; save(); $('#grid').classList.toggle('soft', true); $('#grid').classList.toggle('on', v); draw(); }
@@ -946,6 +1065,7 @@ addEventListener('pointerup', e => {
 addEventListener('keydown', e => {
   shift = e.shiftKey;
   if (e.target.tagName === 'TEXTAREA') return;
+  if ($('#phoneModal').classList.contains('open')){ if (e.key === 'Escape'){ e.preventDefault(); $('#phoneModal').classList.remove('open'); } return; }
   if ($('#helpModal').classList.contains('open')){ if (e.key === 'Escape' || e.code === 'Space'){ e.preventDefault(); closeHelp(); } return; }
   if (e.code === 'Space'){
     e.preventDefault();
@@ -1040,6 +1160,7 @@ $('#png').onclick = exportPNG;
 $('#snap').onclick = () => setSnap(!S.snap);
 $('#grid').onclick = () => setGrid(!S.grid);
 $('#tablet').onclick = () => setTablet(!S.tablet);
+$('#phone').onclick = phoneOpen;
 $('#clear').onclick = clearAll;
 $('#help').onclick = () => openHelp();
 $('#zin').onclick = () => zoomTo(V.z * 1.25);
