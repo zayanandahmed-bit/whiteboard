@@ -29,6 +29,7 @@ button svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;s
 #ctl button{width:42px;height:42px}
 #ctl .dot{width:11px;height:11px;border-radius:50%;background:var(--warn)}
 #ctl .dot.live{background:var(--ok);box-shadow:0 0 0 3px rgba(52,211,153,.25)}
+#ctl button.on{background:var(--accent);color:#0e0e14}
 #ctl .cur{width:24px;height:24px;border-radius:50%;box-shadow:0 0 0 2px rgba(255,255,255,.85)}
 
 /* settings sheet */
@@ -68,7 +69,9 @@ button svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;s
   <button id="curBtn" aria-label="Colour"><span class="cur" id="cur"></span></button>
   <button id="undo" aria-label="Undo"><svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg></button>
   <button id="toolBtn" aria-label="Pen or eraser"></button>
+  <button id="keepBtn" aria-label="Keep drawings on the phone"><svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg></button>
 </div>
+<div id="hint" style="position:fixed;z-index:6;display:none;background:#f4f4f5;color:#18181b;font:600 13px var(--font);padding:9px 12px;border-radius:10px;pointer-events:none"></div>
 <div id="rot"></div>
 <div id="msg"><div><b>Connecting to your laptop…</b>Keep the whiteboard open on the laptop.</div></div>
 
@@ -87,6 +90,10 @@ button svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;s
       <button class="chip" id="fit">Match laptop shape</button><button class="chip" id="fill">Stretch to fill</button>
       <button class="chip" id="fs">Fullscreen</button>
     </div>
+    <h4>On the phone</h4>
+    <div class="row">
+      <button class="chip" id="fade">Fade drawings</button><button class="chip" id="keep">Keep drawings (show the board)</button>
+    </div>
     <div class="tip" id="iosTip" style="display:none"><b>Full screen on iPhone:</b> tap Share → <b>Add to Home Screen</b>, then open Draw Pad from your home screen. Safari's bars disappear.</div>  </div>
 </div>
 
@@ -101,6 +108,8 @@ const ERASER = '<svg viewBox="0 0 24 24"><path d="M8 20h12"/><path d="M4.6 13.4l
 const isIOS = /iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1 && /Mobile/.test(navigator.userAgent));
 const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
 let fill = false; try { fill = localStorage.getItem('pad-fill') === '1'; } catch(e){}
+let keep = false; try { keep = localStorage.getItem('pad-keep') === '1'; } catch(e){}
+let board = null;
 let conn = null, peer = null, aspect = 16/10, state = {color:'ink', wi:1, tool:'pen', colors:[], bg:'#ffffff'};
 let rect = null, active = null, trails = [], raf = 0, wake = null;
 
@@ -181,6 +190,70 @@ function goFull(){
   try { (el.requestFullscreen ? el.requestFullscreen({navigationUI:'hide'}) : el.webkitRequestFullscreen()).catch?.(() => {}); } catch(e){}
 }
 $('#fs').onclick = goFull;
+function hint(text){
+  const h = $('#hint'); h.textContent = text;
+  Object.assign(h.style, {display:'block', left:'50%', top:'14px', transform:'translateX(-50%)'});
+  clearTimeout(hint.t); hint.t = setTimeout(() => h.style.display = 'none', 1800);
+}
+function setKeep(v, quiet){
+  keep = v; try { localStorage.setItem('pad-keep', v ? '1' : '0'); } catch(e){}
+  if (!v) board = null;
+  send({cmd:'mirror', v});
+  $('#keepBtn').classList.toggle('on', v);
+  $('#keep').classList.toggle('on', v); $('#fade').classList.toggle('on', !v);
+  if (!quiet) hint(v ? 'Drawings stay on the phone' : 'Drawings fade on the phone');
+  paint();
+}
+$('#keepBtn').onclick = () => setKeep(!keep);
+$('#keep').onclick = () => setKeep(true);
+$('#fade').onclick = () => setKeep(false);
+
+/* board mirror renderer (same look as the laptop) */
+const font = sz => `600 ${sz}px -apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",Arial,sans-serif`;
+function bbox(o){ return [Math.min(o.x1,o.x2), Math.min(o.y1,o.y2), Math.max(o.x1,o.x2), Math.max(o.y1,o.y2)]; }
+function softFill(){ ctx.save(); ctx.globalAlpha *= board.dark ? .14 : .07; ctx.fill(); ctx.restore(); }
+function drawObj(o){
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = ctx.fillStyle = o.c; ctx.lineWidth = o.w;
+  ctx.beginPath();
+  if (o.t === 'pen'){
+    const p = o.pts, n = p.length/2;
+    if (n === 1){ ctx.arc(p[0], p[1], o.w/2, 0, Math.PI*2); ctx.fill(); return; }
+    ctx.moveTo(p[0], p[1]);
+    for (let i = 1; i < n-1; i++) ctx.quadraticCurveTo(p[2*i], p[2*i+1], (p[2*i]+p[2*i+2])/2, (p[2*i+1]+p[2*i+3])/2);
+    ctx.lineTo(p[2*n-2], p[2*n-1]); ctx.stroke();
+  } else if (o.t === 'line' || o.t === 'arrow'){
+    ctx.moveTo(o.x1, o.y1); ctx.lineTo(o.x2, o.y2);
+    if (o.t === 'arrow'){
+      const a = Math.atan2(o.y2-o.y1, o.x2-o.x1), len = Math.hypot(o.x2-o.x1, o.y2-o.y1);
+      const hl = Math.min(o.w*2.5 + 12*(o.w/4)**.5, len*.5);
+      ctx.moveTo(o.x2 - hl*Math.cos(a-.48), o.y2 - hl*Math.sin(a-.48)); ctx.lineTo(o.x2, o.y2);
+      ctx.lineTo(o.x2 - hl*Math.cos(a+.48), o.y2 - hl*Math.sin(a+.48));
+    }
+    ctx.stroke();
+  } else if (o.t === 'rect'){
+    const [a,b,c,d] = bbox(o), w = c-a, h = d-b;
+    ctx.roundRect(a, b, w, h, Math.max(0, Math.min(o.r || 14, w/4, h/4)));
+    if (o.fill) softFill(); ctx.stroke();
+  } else if (o.t === 'ellipse'){
+    ctx.ellipse((o.x1+o.x2)/2, (o.y1+o.y2)/2, Math.abs(o.x2-o.x1)/2, Math.abs(o.y2-o.y1)/2, 0, 0, Math.PI*2);
+    if (o.fill) softFill(); ctx.stroke();
+  } else if (o.t === 'text'){
+    ctx.font = font(o.size); ctx.textBaseline = 'top';
+    o.text.split('\n').forEach((l, i) => {
+      const lx = o.align === 'center' ? o.x - ctx.measureText(l).width/2 : o.x;
+      ctx.fillText(l, lx, o.y + i*o.size*1.25 + o.size*.1);
+    });
+  }
+}
+function drawBoard(w, h){
+  if (!keep || !board) return;
+  const v = board.v;
+  ctx.save();
+  ctx.transform(w/board.W, 0, 0, h/board.H, 0, 0);
+  ctx.transform(v.z, 0, 0, v.z, v.x, v.y);
+  for (const o of board.objs) try { drawObj(o); } catch(e){}
+  ctx.restore();
+}
 if (!canFS || standalone) $('#fs').style.display = 'none';
 if (isIOS && !standalone) $('#iosTip').style.display = 'block';
 
@@ -222,6 +295,7 @@ document.addEventListener('gesturestart', e => e.preventDefault());
 function paint(){
   const w = cv.width / (devicePixelRatio||1), h = cv.height / (devicePixelRatio||1), now = performance.now();
   ctx.clearRect(0, 0, w, h);
+  drawBoard(w, h);
   trails = trails.filter(t => !t.end || now - t.end < 1600);
   for (const t of trails){
     ctx.globalAlpha = t.end ? Math.max(0, 1 - (now - t.end)/1600) : 1;
@@ -240,8 +314,17 @@ async function keepAwake(){ try { if (!wake && navigator.wakeLock) { wake = awai
 function connect(){
   if (!peer || peer.destroyed || !peer.open) return;
   const c = peer.connect(id, {reliable:true, serialization:'json'});
-  c.on('open', () => { conn = c; status('Connected to laptop', true); msg(); send({cmd:'hello'}); });
-  c.on('data', d => { if (d && d.cmd === 'sync'){ state = d; aspect = d.aspect || aspect; syncUI(); layout(); } });
+  c.on('open', () => { conn = c; status('Connected to laptop', true); msg(); send({cmd:'hello'}); send({cmd:'mirror', v:keep}); });
+  c.on('data', d => {
+    if (!d) return;
+    if (d.cmd === 'sync'){ state = d; aspect = d.aspect || aspect; syncUI(); layout(); }
+    else if (d.cmd === 'board' && keep){
+      board = d;
+      const now = performance.now();                 // the real stroke is on the board now: let the preview go
+      for (const t of trails) if (t.end) t.end = Math.min(t.end, now - 1300);
+      paint(); loop();
+    }
+  });
   c.on('close', () => { if (conn === c){ conn = null; status('Reconnecting…'); msg('Lost the laptop', 'Reconnecting… keep the whiteboard open.'); setTimeout(connect, 1500); } });
 }
 if (!id){
@@ -260,7 +343,7 @@ if (!id){
   peer.on('disconnected', () => { try { peer.reconnect(); } catch(e){} });
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden && !conn) connect(); });
-syncUI(); layout();
+syncUI(); setKeep(keep, true); layout();
 })();
 </script>
 </body>

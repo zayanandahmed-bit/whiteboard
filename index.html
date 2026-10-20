@@ -352,11 +352,11 @@ function commit(){
   hist.push(JSON.stringify(S.objs));
   if (hist.length > 200) hist.shift();
   hi = hist.length - 1;
-  save(); updUndo(); draw();
+  save(); updUndo(); draw(); phoneBoardSoon();
 }
 function revert(){ S.objs = JSON.parse(hist[hi]); }
-function undo(){ settle(true); if (hi > 0){ hi--; revert(); save(); updUndo(); draw(); } }
-function redo(){ settle(true); if (hi < hist.length - 1){ hi++; revert(); save(); updUndo(); draw(); } }
+function undo(){ settle(true); if (hi > 0){ hi--; revert(); save(); updUndo(); draw(); phoneBoardSoon(); } }
+function redo(){ settle(true); if (hi < hist.length - 1){ hi++; revert(); save(); updUndo(); draw(); phoneBoardSoon(); } }
 function updUndo(){ $('#undo').disabled = hi <= 0; $('#redo').disabled = hi >= hist.length - 1; }
 
 /* finish (or cancel) whatever is in progress */
@@ -580,7 +580,7 @@ function resize(){
   cv.width = Math.round(W*DPR); cv.height = Math.round(H*DPR);
   cv.style.width = W+'px'; cv.style.height = H+'px';
   render();
-  if (typeof phoneSync === 'function') phoneSync();
+  if (typeof phoneSync === 'function'){ phoneSync(); phoneBoardSoon(); }
 }
 
 /* ---------- camera ---------- */
@@ -588,7 +588,7 @@ function viewChanged(){
   if (cur) endStroke();                          // pen stays down; a fresh stroke starts on the next move
   [m.x, m.y] = toW(m.sx, m.sy);
   $('#zoomPct').textContent = Math.round(V.z*100) + '%';
-  saveSoon(); draw();
+  saveSoon(); draw(); phoneBoardSoon();
 }
 function zoomAt(sx, sy, f){
   if (ed) closeText(true);
@@ -737,7 +737,7 @@ function phonePeer(id){
   p.on('open', id => { PH.id = id; try { localStorage.setItem(KEY + '-phone', id); } catch(e){} phoneQR(); phoneStatus(PH.conns.size ? 'Phone connected' : 'Waiting for your phone…', PH.conns.size); });
   p.on('connection', c => {
     c.on('open', () => { PH.conns.add(c); phoneSync(); updPhone(); $('#phoneModal').classList.remove('open'); toast('Phone connected — draw on it'); });
-    c.on('data', onPhone);
+    c.on('data', d => onPhone(d, c));
     c.on('close', () => { if (PH.conns.delete(c)){ phoneLift(); updPhone(); toast('Phone disconnected'); } });
   });
   p.on('disconnected', () => { setTimeout(() => { try { if (!p.destroyed) p.reconnect(); } catch(e){} }, 1000); });
@@ -763,10 +763,24 @@ function phoneSync(){
   const msg = {cmd:'sync', aspect: W/H, color:S.color, wi:S.wi, tool:S.tool, dark:S.dark, bg:BG[S.dark?1:0], colors: COLORS.map(([k]) => [k, col(k)])};
   for (const c of PH.conns) try { c.send(msg); } catch(e){}
 }
-function onPhone(d){
+/* mirror the board to phones that asked for it ("Keep drawings") */
+const thin = (p, k) => { const o = []; for (let i = 0; i < p.length; i += 2*k) o.push(p[i], p[i+1]); o.push(p[p.length-2], p[p.length-1]); return o; };
+function boardMsg(){
+  const objs = S.objs.map(o => { const q = {...o, c: col(o.c)}; if (o.pts) q.pts = o.pts.map(v => Math.round(v*10)/10); return q; });
+  const msg = {cmd:'board', W, H, v:{x:V.x, y:V.y, z:V.z}, dark:S.dark, objs};
+  for (let k = 2; JSON.stringify(msg).length > 200000 && k <= 32; k *= 2)   // keep big boards under the data-channel limit
+    msg.objs = objs.map(o => o.pts && o.pts.length > 8 ? {...o, pts: thin(o.pts, k)} : o);
+  return msg;
+}
+function phoneBoardSoon(){
+  if (![...PH.conns].some(c => c.mirror)) return;
+  clearTimeout(PH.bt); PH.bt = setTimeout(() => { const m = boardMsg(); for (const c of PH.conns) if (c.mirror) try { c.send(m); } catch(e){} }, 120);
+}
+function onPhone(d, c){
   if (!d) return;
   if (d.cmd){
-    if (d.cmd === 'color') setColor(d.v);
+    if (d.cmd === 'mirror'){ c.mirror = !!d.v; if (c.mirror) phoneBoardSoon(); }
+    else if (d.cmd === 'color') setColor(d.v);
     else if (d.cmd === 'width') setWidth(d.v);
     else if (d.cmd === 'tool') setTool(d.v === 'eraser' ? 'eraser' : 'pen');
     else if (d.cmd === 'undo') undo();
@@ -902,7 +916,7 @@ function setDark(d){
   const b = $('#dark'); b.querySelector('svg').innerHTML = ICONS[d ? 'sun' : 'moon']; b.querySelector('span').textContent = d ? 'Light' : 'Dark';
   $$('.sw').forEach(s => s.style.background = col(s.dataset.c));
   if (ed) ed.el.style.color = col(ed.c);
-  updCursor(); render(); phoneSync();
+  updCursor(); render(); phoneSync(); phoneBoardSoon();
 }
 function setSnap(v){ S.snap = v; save(); $('#snap').classList.toggle('on', v); $('#snapL').textContent = v ? 'Snap on' : 'Snap'; }
 function setGrid(v){ S.grid = v; save(); $('#grid').classList.toggle('soft', true); $('#grid').classList.toggle('on', v); draw(); }
